@@ -7,3 +7,4 @@ src/.DS_Store
 src/server/pyro_configuration/__pycache__/*
 src/server/raft/__pycache__/*
 src/server/raft/operations/__pycache__/*
+src/server/raft/votes/__pycache__/

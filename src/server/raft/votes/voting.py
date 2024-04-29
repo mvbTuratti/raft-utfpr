@@ -12,6 +12,7 @@ class Vote:
         self.vote = f"{voter}{votee}"
         return self.vote
     def __hash__(self): return hash(self.vote)
+    def __repr__(self): return f"Vote(term={self.term}, vote={self.vote})"
     @property
     def uri(self): return self.votee
 
@@ -25,18 +26,21 @@ class Term:
         self.term = 0
         self.votes = set()
         self.user = user
-        self.self_vote = Vote(user, user)
+        self.self_vote = Vote(self.term, user, user)
         self.majority = number_of_servers // 2
-    def initiate_votes(self, retried: bool = False):
-        self.term = self.term + 1 if retried else self.term
-        self.votes = set(self.self_vote)
-        return (self.term, self.user)
+    def initiate_votes(self):
+        self.term = self.term + 1
+        self.votes = set([self.self_vote])
     def compare_election(self, payload: tuple[int, str]) -> None | Vote:
         (term, user) = payload
         if term > self.term:
             self._update_term(term)
             return Vote(self.user, user)
         return None
+    def compare_term(self, term_idx: int):
+        """ This check is performed to analyze if heartbeat received is greater than current term, if it's node should be
+        a follower"""
+        return term_idx > self.term
     def _update_term(self, term):
         self.term = term
         self.votes = set()
@@ -46,3 +50,6 @@ class Term:
             self.votes.add(vote)
             if len(self.votes) > self.majority: return True
         return False
+    def remove_votes(self):
+        self.votes = set()
+    def __repr__(self): return f"Term(term={self.term}, votes={len(self.votes)})"

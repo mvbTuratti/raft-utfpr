@@ -3,7 +3,10 @@ from enum import Enum, auto
 from Pyro5 import server, api, client
 from random import randint
 from raft.operations.key_value import Redis
+from raft.operations.commits import Commit
 from raft.votes.voting import Term, Vote
+from datetime import datetime
+import time
 import asyncio
 
 class NodeState(Enum):
@@ -14,93 +17,159 @@ class NodeState(Enum):
 @server.expose
 @server.behavior(instance_mode="single")
 class RaftNode(object):
-    state: NodeState
+    _state: NodeState
     _heartbeat_received: asyncio.Event | None
     _election_term_responses: asyncio.Event | None
     redis: Redis
     term: Term
     uri: str
+    commits: set[Commit]
     peers: dict[str, api.Proxy]
+    leader_messaged: bool
+    _callbacks: dict[str, str]
     
-    def __init__(self, peers: dict[str, client.Proxy], timer: int = None):
-        self.state = NodeState.FOLLOWER
+    def __init__(self, peers: dict[str, client.Proxy], uri: str,timer: int = None):
+        print("Init RaftNode object")
         self.peers = peers
         self.follower = None
-        self.leader = None
         self._timer = timer
         self.redis = Redis()
-    def add_uri(self, uri: str): 
+        self.commits = set()
+        self.leader_messaged = False
+        self._callbacks = {}
         self.uri = uri
         self.initiate_term()
+        self.state = NodeState.FOLLOWER
+        print("Finished init")
 
     def initiate_term(self, number_of_servers: int = 4):
         self.term = Term(self.uri, number_of_servers)
+
     @property
     def state(self):
-        return self.state
+        return self._state
     
     @state.setter
     def state(self, value):
+        print(f"State setter: {value}")
         if not isinstance(value, NodeState): raise ValueError("the accepted value is only a node state")
+        self._state = value
         match value:
             case NodeState.FOLLOWER:
                 print("setting as FOLLOWER")
-                self._heartbeat_received = asyncio.Event()
-                self.start()
+                if not self.follower:
+                    self._heartbeat_received = asyncio.Event()
+                    self.start()
             case NodeState.CANDIDATE:
                 print("setting as candidate")
-                asyncio.create_task(self.create_election_term())
+                asyncio.create_task(self._create_election_term())
             case NodeState.LEADER:
                 print("setting as LEADER")
+                asyncio.create_task(self._send_heartbeat_to_followers())
     
     @property
     def timeout(self):
-        return self._timer if self._timer else randint(150, 300)
+        # return self._timer if self._timer else randint(150, 300)
+        return self._timer if self._timer else randint(1500, 3000)
     
     async def _follow_the_leader(self):
-        try:
-            while True:
+        while True:
+            try:
                 await asyncio.wait_for(self._heartbeat_received.wait(), self.timeout / 1000)
                 self._heartbeat_received.clear()
                 print(f"Heartbeat received from leader on {self}")
-        except asyncio.TimeoutError:
-            print("Timeout reached, changing to candidate")
-            self.state = NodeState.CANDIDATE
+            except asyncio.TimeoutError:
+                if self.state == NodeState.FOLLOWER:
+                    self.state = NodeState.CANDIDATE
+                    await asyncio.sleep(1.5)
 
     def start(self):
         self.follower = asyncio.create_task(self._follow_the_leader())
         
-    async def create_election_term(self):
-        vote_payload = self.term.initiate_votes()
+    async def _create_election_term(self):
+        print("Initiated votes...")
         while self.state == NodeState.CANDIDATE:
-            for peer in self.peers:
-                self.peers[peer].request_vote(vote_payload)
+            self.term.initiate_votes()
+            self._send_heartbeats(("Election", None))
             await asyncio.sleep(self.timeout / 1000)
-            vote_payload = self.term.initiate_votes(retried=True) #reset the payload to only contains self vote, same term
-    
+            print("Got term ", self.term)
+
     @server.oneway
     def send_vote_result(self, vote: Vote):
+        print(f"{self} - answering send_vote_result - payload: {vote}")
         is_leader = self.term.add_vote(vote)
         if is_leader: self.state = NodeState.LEADER
 
-    @server.oneway
-    def request_vote(self, vote: tuple[int, str]):
-        vote: None | Vote = self.term.compare_election(vote)
-        if vote: 
-            uri: str = vote.uri
+    def _request_vote(self, vote: tuple[int, str]):
+        (vote_term, uri) = vote
+        print(f"{self} - answer request_vote - payload {vote} - {self.term}")
+        # vote: None | Vote = self.term.compare_election(vote)
+        # print("checked vote", vote)
+        if self.term.term < vote_term: 
             self.peers[uri].send_vote_result(vote)
-    @server.oneway
-    def log_replication(self, command: str):
+
+    def leader_commmand(self, command: str, uri_callback: str):
         print(command, self.uri)
+        self._send_heartbeats(("Append Entries", command))
+        self._callback = uri_callback
+        return True
+        
+    @server.oneway
+    def commit(self, cmd, uri: str, hash:str):
+        print(f"{self} - answering commit - payload: {cmd}")
+        majority_achieved = False
+        if hash in self.commits:
+            for commit in self.commits:
+                majority_achieved = commit.add_ack(uri)
+            if majority_achieved:
+                self.redis.action(cmd)
+                self.commits.remove(hash)
+                self._send_heartbeats("Commit", cmd)
+                if hash in self._callback:
+                    api.Proxy(self._callback[hash]).background_processed(cmd)
+                    del self._callback[hash]
 
     @server.oneway
-    def heartbeat(self, command: tuple[str,str] | None = None):
+    def heartbeat(self, command: tuple[int, str, tuple[str,str], str]):
         self._heartbeat_received.set()
-        if command:
-            print(f"received: {command}")
+        print(f"{self} - answering command - payload: {command}")
+        (term, uri, cmd, hash) = command
+        if self.term.compare_term(term):
+            self.state = NodeState.FOLLOWER
+        (is_election, is_command, to_commit, cmd) = self._handle_command(cmd)
+        if is_election:
+            self._request_vote((term, uri))
+        if is_command and to_commit:
+            self.redis.action(cmd)
+        elif is_command:
+            self.peers[uri].commit(cmd, self.uri, hash)
+    
+    async def _send_heartbeat_to_followers(self):
+        while self.state == NodeState.LEADER:
+            if not self.leader_messaged: #check if already has send a message with cmd
+                self._send_heartbeats()
+            await asyncio.sleep(1) #awaits 100ms before next message
+            self.leader_messaged = False #reset flag
+    
+    def _handle_command(self, cmd: tuple[str, str] | None = None):
+        if not cmd: return (False, False, False, None)
+        match cmd:
+            case ("Election", cmd):
+                return (True, False, False, cmd)
+            case ("Append Entries", cmd):
+                return (False, True, False, cmd)
+            case ("Commit", cmd):
+                return (False, True, True, cmd)
 
-    def _send_heartbeats(self, command: str | None):
+    def _send_heartbeats(self, command: str | tuple | None):
+        self.leader_messaged = True
         for peer in self.peers:
-            payload = (self.uri, command) if command else None
-            self.peers[peer].heartbeat(payload)
+            payload = (self.term.term, self.uri, command, str(datetime.now())) if command else (self.term.term, self.uri, None, None)
+            try:
+                self.peers[peer].heartbeat(payload)
+            except Exception as e:
+                # print(f"Error when trying to send heartbeat {e}")
+                pass
+
+    def __repr__(self): return f"RaftNode({self.uri})"
         

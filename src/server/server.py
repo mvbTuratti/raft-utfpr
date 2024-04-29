@@ -7,9 +7,10 @@ from pyro_configuration.uri_peers import Server, Option
 async def main(server_number: Option):
     daemon = server.Daemon(port=Server.get_port(server_number.value))
     peers: list[str] = Server.get_peers(server_number)
-    current_ledger = RaftNode(peers)
+    uri = Server.create(server_number.value).value
+    print(f'URI - value {server_number} - {uri}')
+    current_ledger = RaftNode(peers, uri=uri)
     uri_object = daemon.register(current_ledger, objectId=server_number.name())
-    current_ledger.add_uri(uri_object)
     loop = asyncio.get_event_loop()
     await loop.run_in_executor(None, daemon.requestLoop)
 
