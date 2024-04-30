@@ -31,6 +31,7 @@ class RaftNode(object):
     def __init__(self, peers: dict[str, client.Proxy], uri: str,timer: int = None):
         print("Init RaftNode object")
         self.peers = peers
+        self._set_peers_timeout()
         self.follower = None
         self._timer = timer
         self.redis = Redis()
@@ -41,6 +42,11 @@ class RaftNode(object):
         self.initiate_term()
         self.state = NodeState.FOLLOWER
         print("Finished init")
+    
+    def _set_peers_timeout(self):
+        """ Sets timeout of 150ms for proxy remote calls """
+        for proxy in self.peers:
+            self.peers[proxy]._pyroTimeout = 0.15
 
     def initiate_term(self, number_of_servers: int = 4):
         self.term = Term(self.uri, number_of_servers)
@@ -61,7 +67,7 @@ class RaftNode(object):
                     self._heartbeat_received = asyncio.Event()
                     self.start()
             case NodeState.CANDIDATE:
-                print("setting as candidate")
+                print("setting as CANDIDATE")
                 asyncio.create_task(self._create_election_term())
             case NodeState.LEADER:
                 print("setting as LEADER")
@@ -77,7 +83,6 @@ class RaftNode(object):
             try:
                 await asyncio.wait_for(self._heartbeat_received.wait(), self.timeout / 1000)
                 self._heartbeat_received.clear()
-                print(f"Heartbeat received from leader on {self}")
             except asyncio.TimeoutError:
                 if self.state == NodeState.FOLLOWER:
                     self.state = NodeState.CANDIDATE
@@ -90,23 +95,41 @@ class RaftNode(object):
         print("Initiated votes...")
         while self.state == NodeState.CANDIDATE:
             self.term.initiate_votes()
-            self._send_heartbeats(("Election", None))
-            await asyncio.sleep(self.timeout / 1000)
-            print("Got term ", self.term)
+            is_leader = await self._gather_election_term()
+            if is_leader: self.state = NodeState.LEADER
 
-    @server.oneway
-    def send_vote_result(self, vote: Vote):
-        print(f"{self} - answering send_vote_result - payload: {vote}")
-        is_leader = self.term.add_vote(vote)
-        if is_leader: self.state = NodeState.LEADER
+    async def _gather_election_term(self) -> bool:
+        """
+        Sends heartbeat to the other servers in parallel with a timeout of 100ms.
+        Returns a list of success statuses for each call.
+        """
+        async def call_proxy(proxy, term: int):
+            try:
+                return self.peers[proxy].vote_for_leader(term)
+            except Exception as e:
+                return False
 
-    def _request_vote(self, vote: tuple[int, str]):
-        (vote_term, uri) = vote
-        print(f"{self} - answer request_vote - payload {vote} - {self.term}")
-        # vote: None | Vote = self.term.compare_election(vote)
-        # print("checked vote", vote)
-        if self.term.term < vote_term: 
-            self.peers[uri].send_vote_result(vote)
+        tasks = [call_proxy(proxy, self.term.term) for proxy in self.peers]
+        results = await asyncio.gather(*tasks)
+        return len([result for result in results if result ]) + 1 > 2 #checks if has the majority 
+
+    def vote_for_leader(self, term: int):
+        self._heartbeat_received.set()
+        print(f"{self} received election campaing")
+        return self.term.compare_term(term)
+    # @server.oneway
+    # def send_vote_result(self, vote: Vote):
+    #     print(f"{self} - answering send_vote_result - payload: {vote}")
+    #     is_leader = self.term.add_vote(vote)
+    #     if is_leader: self.state = NodeState.LEADER
+
+    # def _request_vote(self, vote: tuple[int, str]):
+    #     (vote_term, uri) = vote
+    #     print(f"{self} - answer request_vote - payload {vote} - {self.term}")
+    #     # vote: None | Vote = self.term.compare_election(vote)
+    #     # print("checked vote", vote)
+    #     if self.term.term < vote_term: 
+    #         self.peers[uri].send_vote_result(vote)
 
     def leader_commmand(self, command: str, uri_callback: str):
         print(command, self.uri)
@@ -136,9 +159,7 @@ class RaftNode(object):
         (term, uri, cmd, hash) = command
         if self.term.compare_term(term):
             self.state = NodeState.FOLLOWER
-        (is_election, is_command, to_commit, cmd) = self._handle_command(cmd)
-        if is_election:
-            self._request_vote((term, uri))
+        (is_command, to_commit, cmd) = self._handle_command(cmd)
         if is_command and to_commit:
             self.redis.action(cmd)
         elif is_command:
@@ -152,16 +173,14 @@ class RaftNode(object):
             self.leader_messaged = False #reset flag
     
     def _handle_command(self, cmd: tuple[str, str] | None = None):
-        if not cmd: return (False, False, False, None)
+        if not cmd: return (False, False, None)
         match cmd:
-            case ("Election", cmd):
-                return (True, False, False, cmd)
             case ("Append Entries", cmd):
-                return (False, True, False, cmd)
+                return (True, False, cmd)
             case ("Commit", cmd):
-                return (False, True, True, cmd)
+                return (True, True, cmd)
 
-    def _send_heartbeats(self, command: str | tuple | None):
+    def _send_heartbeats(self, command: str | tuple | None = None):
         self.leader_messaged = True
         for peer in self.peers:
             payload = (self.term.term, self.uri, command, str(datetime.now())) if command else (self.term.term, self.uri, None, None)

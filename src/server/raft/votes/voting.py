@@ -40,7 +40,11 @@ class Term:
     def compare_term(self, term_idx: int):
         """ This check is performed to analyze if heartbeat received is greater than current term, if it's node should be
         a follower"""
-        return term_idx > self.term
+        if term_idx > self.term:
+            self.term = term_idx
+            votes = set()
+            return True
+        return False
     def _update_term(self, term):
         self.term = term
         self.votes = set()
