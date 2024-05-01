@@ -1,4 +1,4 @@
-from Pyro5 import server
+from Pyro5 import server, api
 import asyncio
 import sys
 from raft.node import RaftNode
@@ -9,7 +9,8 @@ async def main(server_number: Option):
     peers: list[str] = Server.get_peers(server_number)
     uri = Server.create(server_number.value).value
     print(f'URI - value {server_number} - {uri}')
-    current_ledger = RaftNode(peers, uri=uri)
+    name_server = api.locate_ns()
+    current_ledger = RaftNode(peers, uri=uri, name_server=name_server)
     uri_object = daemon.register(current_ledger, objectId=server_number.name())
     loop = asyncio.get_event_loop()
     await loop.run_in_executor(None, daemon.requestLoop)
