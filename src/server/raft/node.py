@@ -13,6 +13,7 @@ class NodeState(Enum):
     FOLLOWER = auto()
     CANDIDATE = auto()
     LEADER = auto()
+    def __repr__(self): return f"{self.name}"
 
 @server.expose
 @server.behavior(instance_mode="single")
@@ -122,7 +123,7 @@ class RaftNode(object):
 
         tasks = [call_proxy(proxy, self.term.term) for proxy in self.peers]
         results = await asyncio.gather(*tasks)
-        return len([result for result in results if result ]) + 1 > 2 #checks if has the majority
+        return len([result for result in results if result ]) + 1 > ((len(self.peers) + 1) // 2) #checks if has the majority
 
     async def _send_heartbeat_to_followers(self):
         while self.state == NodeState.LEADER:
@@ -136,7 +137,8 @@ class RaftNode(object):
         match cmd:
             case ("Append Entries", cmd):
                 return (True, False, cmd)
-            case ("Commit", cmd):
+            case ("Commit"):
+                print("Received commit cmd", hash)
                 try:
                     commit = [ commit.cmd for commit in self.commits if commit == hash ][0]
                 except:
@@ -157,7 +159,7 @@ class RaftNode(object):
                 pass
 
     def _create_hash(self) -> str: return str(datetime.now())
-    
+
     # Pyro5 Callbacks
  
     def vote_for_leader(self, term: int):
@@ -168,12 +170,15 @@ class RaftNode(object):
 
     def leader_commmand(self, command: str, uri_callback: str):
         print(command, uri_callback)
-        hash = self._create_hash()
-        self.commits.add(Commit(hash,self.uri, 4, command))
-        self._send_heartbeats(("Append Entries", command), hash)
-        self._callbacks[hash] = uri_callback
-
-        return True
+        (get_command, return_value) = self.redis.check_action(command)
+        if not get_command:
+            hash = self._create_hash()
+            self.commits.add(Commit(hash,self.uri, 4, command))
+            self._send_heartbeats(("Append Entries", command), hash)
+            self._callbacks[hash] = uri_callback
+            return True
+        else:
+            return return_value
     
     @server.oneway
     def commit(self, hash, follower_uri):
@@ -190,7 +195,7 @@ class RaftNode(object):
                 if majority_achieved:
                     print("majority achieved")
                     self.redis.action(commit)
-                    self._send_heartbeats(("Commit", commit.hash))
+                    self._send_heartbeats(("Commit"), commit.hash)
                     if ack.hash in self._callbacks and ack.hash in self.commits:
                         self.commits.remove(ack.hash)
                         api.Proxy(self._callbacks[ack.hash]).background_processed(commit.cmd)
@@ -206,11 +211,21 @@ class RaftNode(object):
         print(f"{self} - answering command - payload: {command}")
         (term, uri, cmd, hash) = command
         if self.term.compare_term(term):
+            latest_timestamp: str = self.redis.get_latest_commit_timestamp()
+            leader = self.name_server.lookup("Leader")
+            list_of_commits = api.Proxy(leader).get_split_commits(latest_timestamp)
+            self.redis.apply_series_of_commits(list_of_commits)
             self.state = NodeState.FOLLOWER
         (is_command, to_commit, cmd) = self._handle_command(cmd, hash)
         if is_command and to_commit:
-            self.redis.action(cmd)
-            self.commits.remove(hash)
+            print("ADDING TO FOLLOWER Commit - ", cmd)
+            try:
+                commit = [ commit for commit in self.commits if commit == hash][0]
+                self.redis.action(commit)
+                self.commits.remove(hash)
+                print("Commited = ", commit.cmd)
+            except:
+                print(f"not able to commit - hash {hash} is missing from follower node")
         elif is_command:
             try:
                 print("sending commit response", uri)
@@ -219,6 +234,16 @@ class RaftNode(object):
                 print("worked")
             except Exception as e:
                 print("Error when responsing command commit ", e)
+
+    def get_split_commits(self, timestamp: str | None): return self.redis.get_series_of_commits(timestamp)
     
     def __repr__(self): return f"RaftNode({self.uri})"
-        
+
+    # Telemetry
+    @server.oneway
+    def telemetry_set_peers(self, peers: list[str]):
+        self.peers = peers
+    def telemetry_get_peers(self): return self.peers
+    def telemetry_get_state(self):  return str(self.state)
+    def telemetry_get_redis_state(self): return self.redis.content
+    def telemetry_get_commit_state(self): return [ str(commit) for commit in self.commits ]

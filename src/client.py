@@ -15,7 +15,8 @@ class Client:
         self.commited_commands = set()
     def send_command(self, cmd):
         leader = self.name_server.lookup("Leader")
-        api.Proxy(leader).leader_commmand(cmd, self.uri)
+        response = api.Proxy(leader).leader_commmand(cmd, self.uri)
+        print(response)
         self.commands.add(cmd)
         self.print_send_cmds()
 

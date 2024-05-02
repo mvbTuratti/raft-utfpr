@@ -8,3 +8,7 @@ src/server/pyro_configuration/__pycache__/*
 src/server/raft/__pycache__/*
 src/server/raft/operations/__pycache__/*
 src/server/raft/votes/__pycache__/
+*/.tool-versions/*
+*/node_modules/*
+*/.vscode/*
+src/frontend/raft/.vscode/
