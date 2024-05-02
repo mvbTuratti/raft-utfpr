@@ -42,8 +42,8 @@ class Redis:
             last_occurrences[parts[1]] = parts[2]
         return [f"SET {key} {value}" for key, value in last_occurrences.items()]    
     def get_series_of_commits(self, timestamp: str = None):
-        if not timestamp: return self._capture_last_occurrence([c.cmd for c in self._commits])
-        return self._capture_last_occurrence([ commit.cmd for commit in self._commits if commit.hash > timestamp ])
+        return self._capture_last_occurrence([c.cmd for c in self._commits])
+        # return self._capture_last_occurrence([ commit.cmd for commit in self._commits if commit.hash > timestamp ])
     def apply_series_of_commits(self, commits: list[str]):
         for commit in commits:
             self.action(commit)
